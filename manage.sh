@@ -14,6 +14,9 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+MATCHZY_DB_CONFIG="overrides/game/csgo/cfg/MatchZy/database.json"
+MATCHZY_SKIP_DOCKER=0
+
 show_header() {
   clear
   echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
@@ -67,6 +70,94 @@ press_enter() {
   read -r
 }
 
+ensure_matchzy_db_config_file() {
+  local config_dir
+  config_dir="$(dirname "$MATCHZY_DB_CONFIG")"
+  mkdir -p "$config_dir"
+  if [[ ! -f "$MATCHZY_DB_CONFIG" ]]; then
+    cat > "$MATCHZY_DB_CONFIG" <<'EOF'
+{
+  "DatabaseType": "MySQL",
+  "MySqlHost": "127.0.0.1",
+  "MySqlDatabase": "matchzy",
+  "MySqlUsername": "matchzy",
+  "MySqlPassword": "matchzy",
+  "MySqlPort": 3306
+}
+EOF
+  fi
+}
+
+update_matchzy_db_config() {
+  local host="$1"
+  local port="$2"
+  local db="$3"
+  local user="$4"
+  local pass="$5"
+  local tmp
+  tmp=$(mktemp)
+  jq --arg host "$host" \
+     --argjson port "$port" \
+     --arg db "$db" \
+     --arg user "$user" \
+     --arg pass "$pass" '
+      .DatabaseType = "MySQL" |
+      .MySqlHost = $host |
+      .MySqlPort = $port |
+      .MySqlDatabase = $db |
+      .MySqlUsername = $user |
+      .MySqlPassword = $pass
+     ' "$MATCHZY_DB_CONFIG" > "$tmp"
+  mv "$tmp" "$MATCHZY_DB_CONFIG"
+}
+
+configure_matchzy_database() {
+  ensure_matchzy_db_config_file
+
+  local current_host current_port current_db current_user current_pass
+  current_host=$(jq -r '.MySqlHost // "127.0.0.1"' "$MATCHZY_DB_CONFIG")
+  current_port=$(jq -r '.MySqlPort // 3306' "$MATCHZY_DB_CONFIG")
+  current_db=$(jq -r '.MySqlDatabase // "matchzy"' "$MATCHZY_DB_CONFIG")
+  current_user=$(jq -r '.MySqlUsername // "matchzy"' "$MATCHZY_DB_CONFIG")
+  current_pass=$(jq -r '.MySqlPassword // "matchzy"' "$MATCHZY_DB_CONFIG")
+
+  echo
+  echo -e "${GREEN}MatchZy Database Configuration${NC}"
+  echo "  1) Auto-manage local MySQL via Docker (default)"
+  echo "  2) Use existing MySQL server (skip Docker provisioning)"
+  echo
+  read -rp "Choose an option [1]: " db_choice
+
+  if [[ "$db_choice" == "2" ]]; then
+    read -rp "MySQL host [$current_host]: " new_host
+    read -rp "MySQL port [$current_port]: " new_port
+    read -rp "Database name [$current_db]: " new_db
+    read -rp "Database user [$current_user]: " new_user
+    read -rp "Database password [$current_pass]: " new_pass
+
+    new_host=${new_host:-$current_host}
+    new_port=${new_port:-$current_port}
+    new_db=${new_db:-$current_db}
+    new_user=${new_user:-$current_user}
+    new_pass=${new_pass:-$current_pass}
+
+    if ! [[ "$new_port" =~ ^[0-9]+$ ]]; then
+      echo -e "${RED}Invalid port number.${NC}"
+      press_enter
+      return 1
+    fi
+
+    update_matchzy_db_config "$new_host" "$new_port" "$new_db" "$new_user" "$new_pass"
+    MATCHZY_SKIP_DOCKER=1
+    echo
+    echo -e "${YELLOW}Docker provisioning will be skipped. Ensure the provided database is reachable.${NC}"
+  else
+    MATCHZY_SKIP_DOCKER=0
+    echo
+    echo -e "${GREEN}Will provision/manage local MatchZy MySQL via Docker.${NC}"
+  fi
+}
+
 require_docker() {
   if ! command -v docker >/dev/null 2>&1; then
     echo -e "${RED}Docker is required for MatchZy database provisioning but is not installed.${NC}"
@@ -91,16 +182,27 @@ require_docker() {
 
 install_servers() {
   local auto_yes=${1:-0}  # Non-interactive mode flag
-
-  if ! require_docker; then
-    return 1
-  fi
   
   show_header
   echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
   echo -e "${CYAN}  Install / Redeploy CS2 Servers${NC}"
   echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
   echo
+  
+  if (( auto_yes == 1 )); then
+    ensure_matchzy_db_config_file
+    MATCHZY_SKIP_DOCKER=0
+  else
+    if ! configure_matchzy_database; then
+      return 1
+    fi
+  fi
+  
+  if (( MATCHZY_SKIP_DOCKER == 0 )); then
+    if ! require_docker; then
+      return 1
+    fi
+  fi
   
   # Auto-detect existing servers or default to 3
   local detected_servers=3
@@ -162,6 +264,12 @@ install_servers() {
 
   echo
   echo -e "${YELLOW}Summary:${NC}"
+  local matchzy_mode
+  if [[ ${MATCHZY_SKIP_DOCKER:-0} -eq 0 ]]; then
+    matchzy_mode="Docker (managed)"
+  else
+    matchzy_mode="External (manual)"
+  fi
   echo "  Servers        : $num_servers"
   echo "  Base port      : $base_port"
   echo "  GOTV base port : $tv_port"
@@ -171,6 +279,7 @@ install_servers() {
   echo "  Update master  : $([[ $update_master_flag -eq 1 ]] && echo Yes || echo No)"
   echo "  RCON password  : $rcon_password"
   echo "  Update plugins : $([[ $run_plugin_update -eq 1 ]] && echo Yes || echo No)"
+  echo "  MatchZy DB     : $matchzy_mode"
   echo
   
   if (( auto_yes == 1 )); then
@@ -226,6 +335,7 @@ install_servers() {
     fi
 
     sudo env \
+      MATCHZY_SKIP_DOCKER="${MATCHZY_SKIP_DOCKER:-0}" \
       NUM_SERVERS="$num_servers" \
       BASE_GAME_PORT="$base_port" \
       BASE_TV_PORT="$tv_port" \
@@ -575,6 +685,16 @@ apply_configs() {
   echo -e "${YELLOW}════════════════════════════════════════════════════════${NC}"
   echo
 
+  if ! configure_matchzy_database; then
+    return 1
+  fi
+
+  if (( MATCHZY_SKIP_DOCKER == 0 )); then
+    if ! require_docker; then
+      return 1
+    fi
+  fi
+
   if ! require_docker; then
     return 1
   fi
@@ -589,7 +709,7 @@ apply_configs() {
   
   if [[ "$confirm" =~ ^[Yy]$ ]]; then
     echo
-    sudo ./scripts/bootstrap_cs2.sh
+    sudo env MATCHZY_SKIP_DOCKER="${MATCHZY_SKIP_DOCKER:-0}" ./scripts/bootstrap_cs2.sh
     echo
     echo "Restarting servers..."
     sudo ./scripts/cs2_tmux.sh restart

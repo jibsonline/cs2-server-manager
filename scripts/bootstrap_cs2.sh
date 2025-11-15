@@ -63,6 +63,7 @@ MATCHZY_DB_CONTAINER="${MATCHZY_DB_CONTAINER:-matchzy-mysql}"
 MATCHZY_DB_VOLUME="${MATCHZY_DB_VOLUME:-matchzy-mysql-data}"
 MATCHZY_DB_IMAGE="${MATCHZY_DB_IMAGE:-mysql:8.0}"
 MATCHZY_DB_ROOT_PASSWORD="${MATCHZY_DB_ROOT_PASSWORD:-MatchZyRoot!2025}"
+MATCHZY_SKIP_DOCKER="${MATCHZY_SKIP_DOCKER:-0}"
 
 LOG_FILE="${SCRIPT_DIR}/bootstrap_cs2_$(date +%Y%m%d_%H%M%S).log"
 log(){ echo "$@" | tee -a "$LOG_FILE"; }
@@ -487,6 +488,11 @@ setup_matchzy_database() {
   db_type=$(jq -r '.DatabaseType // "MySQL"' "$MATCHZY_DB_CONFIG" | tr '[:upper:]' '[:lower:]')
   if [[ "$db_type" != "mysql" ]]; then
     echo "  [i] DatabaseType=${db_type}; skipping Docker provisioning"
+    return 0
+  fi
+
+  if [[ "${MATCHZY_SKIP_DOCKER}" == "1" ]]; then
+    echo "  [i] MATCHZY_SKIP_DOCKER=1: Skipping Docker provisioning (using external database)."
     return 0
   fi
 
