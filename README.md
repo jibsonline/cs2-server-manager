@@ -16,6 +16,8 @@ sudo apt-get update
 sudo apt-get install -y lib32gcc-s1 lib32stdc++6 steamcmd tmux curl jq unzip tar rsync
 ```
 
+> 📦 **Docker required:** Install Docker Engine using the official guide for your distro (https://docs.docker.com/engine/install/) and ensure the daemon is running (`sudo systemctl status docker`). The bootstrapper expects Docker to be present but no longer installs it automatically.
+
 ### Installation
 
 ```bash
@@ -117,6 +119,12 @@ overrides/game/csgo/
 ```
 
 Files in `overrides/` are **preserved during all updates**.
+
+### MatchZy Database (Docker)
+- `scripts/bootstrap_cs2.sh` reads `overrides/game/csgo/cfg/MatchZy/database.json` and automatically provisions a MySQL `matchzy-mysql` Docker container (image: `mysql:8`) with the credentials in that file.
+- The container is exposed on the host port defined in `database.json` (default `3306`) and the script rewrites the `MySqlHost` value to the machine’s primary IP so that every CS2 server instance can reach it.
+- Customize `MySqlDatabase`, `MySqlUsername`, `MySqlPassword`, or `MySqlPort` before running `./manage.sh install` to control what gets created inside the container; changes are preserved in overrides and redeployed on every bootstrap.
+- Docker must already be installed and running; if it is missing, the bootstrapper will stop with instructions to follow the official Docker Engine installation guide.
 
 ### Environment Variables
 ```bash

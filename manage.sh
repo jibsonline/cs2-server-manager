@@ -67,8 +67,34 @@ press_enter() {
   read -r
 }
 
+require_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${RED}Docker is required for MatchZy database provisioning but is not installed.${NC}"
+    echo "Install Docker Engine using the official instructions:"
+    echo "  https://docs.docker.com/engine/install/"
+    echo
+    press_enter
+    return 1
+  fi
+
+  if ! systemctl is-active --quiet docker; then
+    echo -e "${YELLOW}Docker is installed but not running. Attempting to start it...${NC}"
+    if ! sudo systemctl start docker; then
+      echo -e "${RED}Failed to start Docker service. Start Docker manually then retry.${NC}"
+      press_enter
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 install_servers() {
   local auto_yes=${1:-0}  # Non-interactive mode flag
+
+  if ! require_docker; then
+    return 1
+  fi
   
   show_header
   echo -e "${CYAN}════════════════════════════════════════════════════════${NC}"
@@ -548,6 +574,11 @@ apply_configs() {
   echo -e "${YELLOW}  Apply Configuration Changes${NC}"
   echo -e "${YELLOW}════════════════════════════════════════════════════════${NC}"
   echo
+
+  if ! require_docker; then
+    return 1
+  fi
+
   echo "This will:"
   echo "  • Apply configs from game_files/ and overrides/"
   echo "  • Update all server instances"

@@ -58,6 +58,11 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Update defaults now that PROJECT_ROOT is known
 GAME_FILES_DIR="${GAME_FILES_DIR:-${PROJECT_ROOT}/game_files}"
 OVERRIDES_DIR="${OVERRIDES_DIR:-${PROJECT_ROOT}/overrides}"
+MATCHZY_DB_CONFIG="${OVERRIDES_DIR}/game/csgo/cfg/MatchZy/database.json"
+MATCHZY_DB_CONTAINER="${MATCHZY_DB_CONTAINER:-matchzy-mysql}"
+MATCHZY_DB_VOLUME="${MATCHZY_DB_VOLUME:-matchzy-mysql-data}"
+MATCHZY_DB_IMAGE="${MATCHZY_DB_IMAGE:-mysql:8.0}"
+MATCHZY_DB_ROOT_PASSWORD="${MATCHZY_DB_ROOT_PASSWORD:-MatchZyRoot!2025}"
 
 LOG_FILE="${SCRIPT_DIR}/bootstrap_cs2_$(date +%Y%m%d_%H%M%S).log"
 log(){ echo "$@" | tee -a "$LOG_FILE"; }
@@ -85,7 +90,8 @@ if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     curl wget file tar bzip2 xz-utils unzip ca-certificates \
-    lib32gcc-s1 lib32stdc++6 libc6-i386 net-tools tmux steamcmd rsync >/dev/null
+    lib32gcc-s1 lib32stdc++6 libc6-i386 net-tools tmux steamcmd rsync \
+    jq >/dev/null
 else
   echo "Only Debian/Ubuntu supported for now"; exit 1
 fi
@@ -414,6 +420,157 @@ EOF
   echo "  [✓] Server #${server_num} configured (server.cfg + autoexec.cfg)"
 }
 
+detect_primary_ip() {
+  local ip
+  ip=$(ip route get 1.1.1.1 2>/dev/null | awk '/src/ {print $7; exit}')
+  ip=${ip:-$(hostname -I 2>/dev/null | awk '{print $1}')}
+  ip=${ip:-127.0.0.1}
+  echo "$ip"
+}
+
+ensure_docker() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "  [!] Docker is required for the MatchZy database. Please install Docker Engine using the official instructions:"
+    echo "      https://docs.docker.com/engine/install/"
+    return 1
+  fi
+
+  systemctl enable docker >/dev/null 2>&1 || true
+  systemctl start docker >/dev/null 2>&1 || true
+}
+
+update_matchzy_database_json() {
+  local host="$1"
+  local port="$2"
+  local orig_owner=""
+  local orig_mode=""
+
+  if [[ -f "$MATCHZY_DB_CONFIG" ]]; then
+    orig_owner=$(stat -c '%u:%g' "$MATCHZY_DB_CONFIG" 2>/dev/null || echo "")
+    orig_mode=$(stat -c '%a' "$MATCHZY_DB_CONFIG" 2>/dev/null || echo "")
+  fi
+
+  local tmp
+  tmp=$(mktemp)
+  jq --arg host "$host" --argjson port "$port" '
+    .DatabaseType = "MySQL" |
+    .MySqlHost = $host |
+    .MySqlPort = $port
+  ' "$MATCHZY_DB_CONFIG" > "$tmp"
+  mv "$tmp" "$MATCHZY_DB_CONFIG"
+
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    chown "${SUDO_USER}:${SUDO_USER}" "$MATCHZY_DB_CONFIG" 2>/dev/null || true
+  elif [[ -n "$orig_owner" ]]; then
+    chown "$orig_owner" "$MATCHZY_DB_CONFIG" 2>/dev/null || true
+  fi
+
+  if [[ -n "$orig_mode" ]]; then
+    chmod "$orig_mode" "$MATCHZY_DB_CONFIG" 2>/dev/null || true
+  else
+    chmod 664 "$MATCHZY_DB_CONFIG" 2>/dev/null || true
+  fi
+}
+
+setup_matchzy_database() {
+  if [[ ! -f "$MATCHZY_DB_CONFIG" ]]; then
+    echo "  [i] MatchZy database config not found at ${MATCHZY_DB_CONFIG}, skipping Docker provisioning"
+    return 0
+  fi
+
+  if ! jq empty "$MATCHZY_DB_CONFIG" >/dev/null 2>&1; then
+    echo "  [!] MatchZy database config is not valid JSON"
+    return 1
+  fi
+
+  local db_type
+  db_type=$(jq -r '.DatabaseType // "MySQL"' "$MATCHZY_DB_CONFIG" | tr '[:upper:]' '[:lower:]')
+  if [[ "$db_type" != "mysql" ]]; then
+    echo "  [i] DatabaseType=${db_type}; skipping Docker provisioning"
+    return 0
+  fi
+
+  ensure_docker || return 1
+
+  local mysql_db mysql_user mysql_pass mysql_port
+  mysql_db=$(jq -r '.MySqlDatabase // "matchzy"' "$MATCHZY_DB_CONFIG")
+  mysql_user=$(jq -r '.MySqlUsername // "matchzy"' "$MATCHZY_DB_CONFIG")
+  mysql_pass=$(jq -r '.MySqlPassword // "matchzy"' "$MATCHZY_DB_CONFIG")
+  mysql_port=$(jq -r '.MySqlPort // 3306' "$MATCHZY_DB_CONFIG")
+  if ! [[ "$mysql_port" =~ ^[0-9]+$ ]]; then
+    mysql_port=3306
+  fi
+
+  local container_name="$MATCHZY_DB_CONTAINER"
+  local container_exists=0
+  local current_port=""
+
+  if docker ps -a --format '{{.Names}}' | grep -Fxq "$container_name"; then
+    container_exists=1
+    current_port=$(docker inspect -f '{{range $p, $cfg := .NetworkSettings.Ports}}{{if eq $p "3306/tcp"}}{{(index $cfg 0).HostPort}}{{end}}{{end}}' "$container_name" 2>/dev/null || echo "")
+  fi
+
+  if ss -ltn 2>/dev/null | grep -q ":${mysql_port} "; then
+    if (( container_exists == 0 )) || [[ "$current_port" != "$mysql_port" ]]; then
+      echo "  [!] Port ${mysql_port} is already in use on this host."
+      echo "      Update ${MATCHZY_DB_CONFIG} (MySqlPort) to a free port or point it at your existing database."
+      echo "      After editing, rerun ./scripts/bootstrap_cs2.sh."
+      return 1
+    fi
+  fi
+
+  local host_ip
+  host_ip=$(detect_primary_ip)
+  update_matchzy_database_json "$host_ip" "$mysql_port"
+
+  local recreate=0
+
+  if (( container_exists == 1 )); then
+    if [[ "$current_port" != "$mysql_port" ]]; then
+      echo "  [*] Recreating ${container_name} to use host port ${mysql_port}"
+      docker rm -f "$container_name" >/dev/null
+      recreate=1
+    fi
+  else
+    recreate=1
+  fi
+
+  if (( recreate == 1 )); then
+    docker pull "$MATCHZY_DB_IMAGE" >/dev/null
+    docker run -d \
+      --name "$container_name" \
+      -e MYSQL_ROOT_PASSWORD="$MATCHZY_DB_ROOT_PASSWORD" \
+      -e MYSQL_DATABASE="$mysql_db" \
+      -e MYSQL_USER="$mysql_user" \
+      -e MYSQL_PASSWORD="$mysql_pass" \
+      -p "${mysql_port}:3306" \
+      -v "${MATCHZY_DB_VOLUME}:/var/lib/mysql" \
+      --restart unless-stopped \
+      "$MATCHZY_DB_IMAGE" >/dev/null
+    echo "  [✓] Started MatchZy MySQL container (${container_name}) on port ${mysql_port}"
+  else
+    docker start "$container_name" >/dev/null
+    echo "  [✓] MatchZy MySQL container (${container_name}) already running"
+  fi
+
+  local ready=0
+  for _ in {1..30}; do
+    if docker exec "$container_name" mysqladmin ping -h "127.0.0.1" -uroot -p"$MATCHZY_DB_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
+      ready=1
+      break
+    fi
+    sleep 1
+  done
+
+  if (( ready == 1 )); then
+    echo "  [✓] MatchZy database is ready at ${host_ip}:${mysql_port}"
+  else
+    echo "  [i] MatchZy database is starting up (Docker container is running)"
+  fi
+
+  return 0
+}
+
 stop_tmux_server() {
   local server_num="$1"
   local session_name="cs2-${server_num}"
@@ -435,22 +592,30 @@ echo "[*] Setting up ${NUM_SERVERS} CS2 servers..."
 echo
 
 # Create the single cs2 user
-echo "[1/4] Creating CS2 user..."
+echo "[1/5] Creating CS2 user..."
 create_cs2_user "$CS2_USER"
 echo
 
 # Install/update master via SteamCMD
-echo "[2/4] Installing/updating master CS2 installation..."
+echo "[2/5] Installing/updating master CS2 installation..."
 install_master_via_steamcmd "$CS2_USER"
 echo
 
 # Setup Steam SDK symlinks (required for server to start)
-echo "[3/4] Setting up Steam SDK symlinks..."
+echo "[3/5] Setting up Steam SDK symlinks..."
 setup_steam_sdk_links "$CS2_USER"
 echo
 
+# Provision MatchZy database via Docker (if configured)
+echo "[4/5] Provisioning MatchZy database (Docker)..."
+if ! setup_matchzy_database; then
+  echo "  [!] MatchZy database provisioning skipped (config missing or Docker unavailable)"
+  echo "      Install Docker and rerun bootstrap if you need the built-in database."
+fi
+echo
+
 # Setup shared config directory
-echo "[4/4] Setting up shared configuration..."
+echo "[5/5] Setting up shared configuration..."
 setup_shared_config "$CS2_USER"
 echo
 

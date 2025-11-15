@@ -2,7 +2,7 @@
   "DatabaseType": "MySQL",
   "MySqlHost": "192.168.254.232",
   "MySqlDatabase": "matchzy",
-  "MySqlUsername": "get5",
-  "MySqlPassword": "yalla",
+  "MySqlUsername": "matchzy",
+  "MySqlPassword": "matchzy",
   "MySqlPort": 3306
 }
