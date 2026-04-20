@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"syscall"
 )
@@ -203,27 +202,27 @@ func (up *PluginUpdater) httpClient() *http.Client {
 }
 
 func (up *PluginUpdater) downloadMetamod(w io.Writer) error {
-	// Scrape the Metamod dev downloads page for the latest build number.
 	const mmBranch = "2.0"
-	const mmPage = "https://www.metamodsource.net/downloads.php?branch=dev"
+	// AlliedModders publishes a plain-text pointer to the current Linux tarball
+	// for each branch. Using this pointer (rather than scraping the HTML
+	// downloads page) avoids a race where the dev page advertises a build
+	// number whose tarball has not yet been uploaded to the mirror, causing
+	// downloads to 403 and breaking plugin installs.
+	pointerURL := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/mmsource-latest-linux", mmBranch)
 
-	// Use retry logic for network operations
 	cfg := DefaultRetryConfig()
-	data, err := RetryHTTPRead(up.httpClient(), mmPage, cfg)
+	data, err := RetryHTTPRead(up.httpClient(), pointerURL, cfg)
 	if err != nil {
-		return fmt.Errorf("failed to fetch Metamod download page after retries: %w", err)
+		return fmt.Errorf("failed to fetch Metamod latest-linux pointer after retries: %w", err)
+	}
+	filename := strings.TrimSpace(string(data))
+	if filename == "" || strings.ContainsAny(filename, "/\r\n") || !strings.HasSuffix(filename, ".tar.gz") {
+		return fmt.Errorf("unexpected Metamod pointer content: %q", string(data))
 	}
 
-	re := regexp.MustCompile(`Latest downloads for version.*?build\s+([0-9]+)`)
-	m := re.FindStringSubmatch(string(data))
-	build := "1374"
-	if len(m) >= 2 {
-		build = m[1]
-	}
+	url := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/%s", mmBranch, filename)
 
-	url := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/mmsource-%s.0-git%s-linux.tar.gz", mmBranch, mmBranch, build)
-
-	fmt.Fprintf(w, "[Metamod] Downloading Metamod:Source %s build %s...\n", mmBranch, build)
+	fmt.Fprintf(w, "[Metamod] Downloading %s...\n", filename)
 	resp2, err := RetryHTTPGet(up.httpClient(), url, cfg)
 	if err != nil {
 		return fmt.Errorf("failed to download Metamod archive after retries: %w", err)
