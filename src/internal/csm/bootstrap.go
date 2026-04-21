@@ -821,37 +821,18 @@ func configureMetamodGo(w io.Writer, user string, serverNum int, enable bool) er
 	}
 
 	content := string(data)
-	const needle = "csgo/addons/metamod"
-
 	if enable {
 		fmt.Fprintf(w, "  [*] Enabling Metamod in gameinfo.gi for server-%d\n", serverNum)
-		if !strings.Contains(content, needle) {
-			// Simple insertion: append a new Game line after Game_LowViolence csgo_lv, similar to sed-based script.
-			lines := strings.Split(content, "\n")
-			var out []string
-			inserted := false
-			for _, line := range lines {
-				out = append(out, line)
-				if !inserted && strings.Contains(line, "Game_LowViolence") && strings.Contains(line, "csgo_lv") {
-					out = append(out, "                        Game    csgo/addons/metamod")
-					inserted = true
-				}
-			}
-			if !inserted {
-				out = append(out, "                        Game    csgo/addons/metamod")
-			}
-			content = strings.Join(out, "\n")
+		newContent, changed, warn := enableMetamodInGameInfo(content)
+		if warn != "" {
+			fmt.Fprintf(w, "  [!] %s\n", warn)
+		}
+		if changed {
+			content = newContent
 		}
 	} else {
 		fmt.Fprintf(w, "  [*] Disabling Metamod in gameinfo.gi for server-%d\n", serverNum)
-		var out []string
-		for _, line := range strings.Split(content, "\n") {
-			if strings.Contains(line, needle) {
-				continue
-			}
-			out = append(out, line)
-		}
-		content = strings.Join(out, "\n")
+		content = disableMetamodInGameInfo(content)
 	}
 
 	if err := os.WriteFile(gameinfo, []byte(content), 0o644); err != nil {
@@ -863,6 +844,177 @@ func configureMetamodGo(w io.Writer, user string, serverNum int, enable bool) er
 		_ = ensureOwnedByUser(user, backup)
 	}
 	return nil
+}
+
+// metamodSearchPath is the exact value Valve/Metamod expect as a new Game
+// search path when Metamod is loaded. Case and slashes match the line that
+// Valve's loader resolves at startup.
+const metamodSearchPath = "csgo/addons/metamod"
+
+// enableMetamodInGameInfo inserts a `Game csgo/addons/metamod` search path into
+// the first SearchPaths block inside the FileSystem block of gameinfo.gi,
+// following the AlliedModders-recommended position (immediately after the
+// Game_LowViolence line when present, otherwise at the top of the block).
+//
+// It is:
+//   - Block-aware: uses brace depth to target the correct FileSystem→SearchPaths
+//     block and ignores any stray `SearchPaths` keywords elsewhere in the file.
+//   - Indentation-preserving: copies the leading whitespace of the anchor line
+//     so the new entry lines up with siblings regardless of tabs vs spaces.
+//   - Idempotent: if any `Game <something>/addons/metamod` entry already exists
+//     inside the target block, the file is returned unchanged.
+//
+// Returns (newContent, changed, warning). A non-empty warning indicates we
+// couldn't confidently locate the block and the caller should surface it; the
+// file is still returned unchanged in that case.
+func enableMetamodInGameInfo(content string) (string, bool, string) {
+	lines := strings.Split(content, "\n")
+
+	fsStart, fsEnd, ok := findBlockRange(lines, "FileSystem", 0)
+	if !ok {
+		return content, false, "gameinfo.gi: could not locate FileSystem block; skipping Metamod enable"
+	}
+	spStart, spEnd, ok := findBlockRange(lines, "SearchPaths", fsStart+1)
+	if !ok || spStart > fsEnd {
+		return content, false, "gameinfo.gi: could not locate SearchPaths block inside FileSystem; skipping Metamod enable"
+	}
+
+	// Idempotency: bail if the metamod path is already mentioned anywhere inside
+	// the target SearchPaths block. We scan the block only, so a stray reference
+	// elsewhere (e.g. a comment) doesn't wrongly suppress a needed insert.
+	for i := spStart + 1; i < spEnd; i++ {
+		if strings.Contains(lines[i], metamodSearchPath) {
+			return content, false, ""
+		}
+	}
+
+	// Prefer the AlliedModders canonical anchor: insert after the Game_LowViolence
+	// line inside this block. Fall back to the top of the block.
+	insertAt := spStart + 1
+	anchorLine := ""
+	for i := spStart + 1; i < spEnd; i++ {
+		if strings.Contains(lines[i], "Game_LowViolence") {
+			insertAt = i + 1
+			anchorLine = lines[i]
+			break
+		}
+	}
+	if anchorLine == "" {
+		// No Game_LowViolence: find the first `Game ` line to borrow indentation
+		// from; insert immediately before it if found, else right after `{`.
+		for i := spStart + 1; i < spEnd; i++ {
+			t := strings.TrimLeft(lines[i], " \t")
+			if strings.HasPrefix(t, "Game") {
+				insertAt = i
+				anchorLine = lines[i]
+				break
+			}
+		}
+	}
+
+	indent := leadingIndent(anchorLine)
+	if indent == "" {
+		// No anchor with indentation found; derive from the SearchPaths `{` line
+		// by adding one level of the file's prevailing indent (tab if we see any
+		// tab-indented line in the block, else four spaces).
+		indent = leadingIndent(lines[spStart]) + inferOneIndent(lines[spStart+1:spEnd])
+	}
+	newLine := indent + "Game\t" + metamodSearchPath
+
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:insertAt]...)
+	out = append(out, newLine)
+	out = append(out, lines[insertAt:]...)
+	return strings.Join(out, "\n"), true, ""
+}
+
+// disableMetamodInGameInfo removes any line that references metamodSearchPath.
+// This is intentionally permissive — it strips stray entries from older manual
+// edits as well as our own.
+func disableMetamodInGameInfo(content string) string {
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		if strings.Contains(line, metamodSearchPath) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// findBlockRange locates a `<name> { ... }` block using KeyValues-style
+// brace counting. It returns the line index of the opening `{` and of the
+// matching closing `}` (exclusive of inner content). Nested blocks are
+// handled; mismatched braces yield ok=false.
+//
+// `startLine` is where to begin searching (0 for the whole file).
+func findBlockRange(lines []string, name string, startLine int) (openIdx, closeIdx int, ok bool) {
+	for i := startLine; i < len(lines); i++ {
+		trimmed := strings.TrimSpace(lines[i])
+		if !strings.HasPrefix(trimmed, name) {
+			continue
+		}
+		// Accept `Name` on this line and `{` on the same or a later line.
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, name))
+		openIdx = -1
+		if strings.HasPrefix(rest, "{") {
+			openIdx = i
+		} else if rest == "" || strings.HasPrefix(rest, "//") {
+			for j := i + 1; j < len(lines); j++ {
+				t := strings.TrimSpace(lines[j])
+				if t == "" || strings.HasPrefix(t, "//") {
+					continue
+				}
+				if strings.HasPrefix(t, "{") {
+					openIdx = j
+				}
+				break
+			}
+		}
+		if openIdx < 0 {
+			continue
+		}
+		// Now walk forward counting braces to find the matching close.
+		depth := 0
+		for j := openIdx; j < len(lines); j++ {
+			for _, r := range lines[j] {
+				switch r {
+				case '{':
+					depth++
+				case '}':
+					depth--
+					if depth == 0 {
+						return openIdx, j, true
+					}
+				}
+			}
+		}
+		return 0, 0, false
+	}
+	return 0, 0, false
+}
+
+// leadingIndent returns the leading whitespace (spaces/tabs) of a line.
+func leadingIndent(line string) string {
+	for i, r := range line {
+		if r != ' ' && r != '\t' {
+			return line[:i]
+		}
+	}
+	return line
+}
+
+// inferOneIndent heuristically picks a one-level indent unit by inspecting a
+// slice of lines from inside a block: returns "\t" if any indented line uses
+// a tab, else four spaces.
+func inferOneIndent(innerLines []string) string {
+	for _, l := range innerLines {
+		if strings.HasPrefix(l, "\t") {
+			return "\t"
+		}
+	}
+	return "    "
 }
 
 // writeSharedServerConfig writes RCON password and maxplayers to the shared cs2-config/server.cfg
