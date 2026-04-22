@@ -317,10 +317,18 @@ func isMetamodLinuxAsset(name string) bool {
 	return true
 }
 
-func (up *PluginUpdater) downloadCounterStrikeSharp(w io.Writer) error {
-	const apiURL = "https://api.github.com/repos/roflmuffin/CounterStrikeSharp/releases/latest"
+// CSS releases are pulled from this fork rather than upstream
+// roflmuffin/CounterStrikeSharp. The fork carries the AnimGraph2 ABI fix
+// (threadtools symbol rename + hl2sdk bump) that is required after the
+// April 21 2026 CS2 engine update; upstream had not shipped a release with
+// that fix as of this CSM release. To switch back to upstream, change this
+// constant to "roflmuffin/CounterStrikeSharp".
+const counterStrikeSharpRepo = "jibsonline/CounterStrikeSharp"
 
-	fmt.Fprintln(w, "[CSS] Fetching latest CounterStrikeSharp release...")
+func (up *PluginUpdater) downloadCounterStrikeSharp(w io.Writer) error {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", counterStrikeSharpRepo)
+
+	fmt.Fprintf(w, "[CSS] Fetching latest CounterStrikeSharp release from %s...\n", counterStrikeSharpRepo)
 	var payload struct {
 		TagName string `json:"tag_name"`
 		Assets  []struct {
