@@ -202,32 +202,17 @@ func (up *PluginUpdater) httpClient() *http.Client {
 }
 
 func (up *PluginUpdater) downloadMetamod(w io.Writer) error {
-	const mmBranch = "2.0"
-	// AlliedModders publishes a plain-text pointer to the current Linux tarball
-	// for each branch. Using this pointer (rather than scraping the HTML
-	// downloads page) avoids a race where the dev page advertises a build
-	// number whose tarball has not yet been uploaded to the mirror, causing
-	// downloads to 403 and breaking plugin installs.
-	pointerURL := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/mmsource-latest-linux", mmBranch)
-
-	cfg := DefaultRetryConfig()
-	data, err := RetryHTTPRead(up.httpClient(), pointerURL, cfg)
+	url, filename, source, err := up.resolveMetamodURL(w)
 	if err != nil {
-		return fmt.Errorf("failed to fetch Metamod latest-linux pointer after retries: %w", err)
-	}
-	filename := strings.TrimSpace(string(data))
-	if filename == "" || strings.ContainsAny(filename, "/\r\n") || !strings.HasSuffix(filename, ".tar.gz") {
-		return fmt.Errorf("unexpected Metamod pointer content: %q", string(data))
+		return err
 	}
 
-	url := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/%s", mmBranch, filename)
-
-	fmt.Fprintf(w, "[Metamod] Downloading %s...\n", filename)
-	resp2, err := RetryHTTPGet(up.httpClient(), url, cfg)
+	fmt.Fprintf(w, "[Metamod] Downloading %s from %s...\n", filename, source)
+	resp, err := RetryHTTPGet(up.httpClient(), url, DefaultRetryConfig())
 	if err != nil {
-		return fmt.Errorf("failed to download Metamod archive after retries: %w", err)
+		return fmt.Errorf("failed to download Metamod archive from %s after retries: %w", url, err)
 	}
-	defer resp2.Body.Close()
+	defer resp.Body.Close()
 
 	tmpPath := filepath.Join(up.TempDir, "metamod.tar.gz")
 	f, err := os.Create(tmpPath)
@@ -239,9 +224,9 @@ func (up *PluginUpdater) downloadMetamod(w io.Writer) error {
 		dest:     f,
 		progress: w,
 		label:    "[Metamod]",
-		total:    resp2.ContentLength,
+		total:    resp.ContentLength,
 	}
-	if _, err := io.Copy(pw, resp2.Body); err != nil {
+	if _, err := io.Copy(pw, resp.Body); err != nil {
 		_ = f.Close()
 		return err
 	}
@@ -252,6 +237,84 @@ func (up *PluginUpdater) downloadMetamod(w io.Writer) error {
 	fmt.Fprintf(w, "[Metamod] Extracting to %s/csgo/...\n", up.GameDir)
 	// Use system tar for simplicity; dependencies are installed by InstallDependencies.
 	return runCmdLogged(w, "tar", "-xzf", tmpPath, "-C", filepath.Join(up.GameDir, "csgo"))
+}
+
+// resolveMetamodURL picks the download URL for the newest Metamod:Source
+// Linux tarball. It prefers GitHub releases — each AlliedModders CI build
+// lands there as a signed release immediately — and only falls back to the
+// AlliedModders mirror's "mmsource-latest-linux" pointer if GitHub is
+// unreachable or has no matching asset. The mirror pointer can lag by hours
+// after a new build is tagged, and individual per-build tarballs on the
+// mirror routinely return 403 until ACLs propagate; both conditions broke
+// plugin installs after the April 21 2026 ("AnimGraph2") CS2 update, which
+// motivated this change.
+//
+// Returns (url, filename, source label, error).
+func (up *PluginUpdater) resolveMetamodURL(w io.Writer) (string, string, string, error) {
+	const ghListURL = "https://api.github.com/repos/alliedmodders/metamod-source/releases?per_page=10"
+
+	type ghRelease struct {
+		TagName    string `json:"tag_name"`
+		Prerelease bool   `json:"prerelease"`
+		Assets     []struct {
+			Name string `json:"name"`
+			URL  string `json:"browser_download_url"`
+		} `json:"assets"`
+	}
+
+	var releases []ghRelease
+	if err := up.fetchJSON(ghListURL, &releases); err != nil {
+		fmt.Fprintf(w, "[Metamod] GitHub releases lookup failed (%v); falling back to AlliedModders mirror.\n", err)
+	} else if len(releases) == 0 {
+		fmt.Fprintln(w, "[Metamod] GitHub returned no releases; falling back to AlliedModders mirror.")
+	} else {
+		// GitHub returns releases newest-first. AlliedModders marks every CI
+		// build as a prerelease, so we must NOT filter by the Prerelease flag.
+		// Pick the first release whose assets include a Linux tarball.
+		for _, rel := range releases {
+			for _, a := range rel.Assets {
+				if isMetamodLinuxAsset(a.Name) {
+					fmt.Fprintf(w, "[Metamod] Target: %s (GitHub release %s)\n", a.Name, rel.TagName)
+					return a.URL, a.Name, "GitHub", nil
+				}
+			}
+		}
+		fmt.Fprintln(w, "[Metamod] No Linux tarball found in recent GitHub releases; falling back to AlliedModders mirror.")
+	}
+
+	// Fallback: AlliedModders "-latest-linux" pointer.
+	const mmBranch = "2.0"
+	pointerURL := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/mmsource-latest-linux", mmBranch)
+	data, err := RetryHTTPRead(up.httpClient(), pointerURL, DefaultRetryConfig())
+	if err != nil {
+		return "", "", "", fmt.Errorf("failed to fetch Metamod latest-linux pointer after retries: %w", err)
+	}
+	filename := strings.TrimSpace(string(data))
+	if filename == "" || strings.ContainsAny(filename, "/\r\n") || !strings.HasSuffix(filename, ".tar.gz") {
+		return "", "", "", fmt.Errorf("unexpected Metamod pointer content: %q", string(data))
+	}
+	url := fmt.Sprintf("https://mms.alliedmods.net/mmsdrop/%s/%s", mmBranch, filename)
+	fmt.Fprintf(w, "[Metamod] Target: %s (AlliedModders mirror pointer)\n", filename)
+	return url, filename, "AlliedModders mirror", nil
+}
+
+// isMetamodLinuxAsset reports whether the given GitHub release asset is the
+// Metamod:Source Linux tarball we want. AlliedModders currently names the
+// asset "mmsource-<tag>-linux.tar.gz", but we match loosely to remain
+// resilient to cosmetic renames (e.g. architecture qualifiers).
+func isMetamodLinuxAsset(name string) bool {
+	lower := strings.ToLower(name)
+	if !strings.HasSuffix(lower, ".tar.gz") {
+		return false
+	}
+	if !strings.Contains(lower, "linux") {
+		return false
+	}
+	// Exclude SDK or source archives that may also land on a release.
+	if strings.Contains(lower, "sdk") || strings.Contains(lower, "source-sdk") {
+		return false
+	}
+	return true
 }
 
 func (up *PluginUpdater) downloadCounterStrikeSharp(w io.Writer) error {
