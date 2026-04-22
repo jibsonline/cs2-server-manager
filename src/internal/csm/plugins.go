@@ -317,13 +317,14 @@ func isMetamodLinuxAsset(name string) bool {
 	return true
 }
 
-// CSS releases are pulled from this fork rather than upstream
-// roflmuffin/CounterStrikeSharp. The fork carries the AnimGraph2 ABI fix
-// (threadtools symbol rename + hl2sdk bump) that is required after the
-// April 21 2026 CS2 engine update; upstream had not shipped a release with
-// that fix as of this CSM release. To switch back to upstream, change this
-// constant to "roflmuffin/CounterStrikeSharp".
-const counterStrikeSharpRepo = "jibsonline/CounterStrikeSharp"
+// counterStrikeSharpRepo is the GitHub repo CSM pulls CounterStrikeSharp
+// releases from. Upstream roflmuffin/CounterStrikeSharp v1.0.366 (merged
+// via PR #1279) carries the AnimGraph2 ABI fix needed after the April 21
+// 2026 CS2 engine update, so we track upstream again.
+//
+// If upstream ever falls behind a breaking CS2 engine update, point this
+// at a fork (e.g. "jibsonline/CounterStrikeSharp") that ships a rebuild.
+const counterStrikeSharpRepo = "roflmuffin/CounterStrikeSharp"
 
 func (up *PluginUpdater) downloadCounterStrikeSharp(w io.Writer) error {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/releases/latest", counterStrikeSharpRepo)
